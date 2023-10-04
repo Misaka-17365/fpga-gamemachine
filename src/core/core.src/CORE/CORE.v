@@ -56,6 +56,9 @@ module CORE (
     wire[`UI_MEM_LEN-1:0]   id_ui_mem;
     wire[`UI_WB_LEN-1:0]    id_ui_wb;
     wire[`UI_PC_LEN-1:0]    id_ui_pc;
+    wire[37:0]              ex_bypass;
+    wire[36:0]              mem_bypass;
+    wire                    pause;
     CORE__ID core__id(
         .i_RST(flush),
         .i_CLK(i_CLK),
@@ -71,8 +74,12 @@ module CORE (
         .o_ui_ex(id_ui_ex),
         .o_ui_mem(id_ui_mem),
         .o_ui_wb(id_ui_wb),
-        .o_ui_pc(id_ui_pc)
+        .o_ui_pc(id_ui_pc),
+        .i_ex_bypass(ex_bypass),
+        .i_mem_bypass(mem_bypass),
+        .o_pause(pause)
     );
+    assign  pause_n = ~pause;
     
     wire[`UI_MEM_LEN-1:0]   ex_ui_mem;
     wire[`UI_WB_LEN-1:0]    ex_ui_wb;
@@ -99,7 +106,8 @@ module CORE (
         .o_ui_wb(ex_ui_wb),
 
         .o_RAM_addr(ex_RAM_addr),
-        .o_ex_data(ex_data)
+        .o_ex_data(ex_data),
+        .o_ex_bypass(ex_bypass)
     );
 
     wire[`UI_WB_LEN-1:0]    mem_ui_wb;
@@ -120,7 +128,8 @@ module CORE (
 
         .i_ui_wb(ex_ui_wb),
         .o_ui_wb(mem_ui_wb),
-        .o_mem_data(mem_data)
+        .o_mem_data(mem_data),
+        .o_mem_bypass(mem_bypass)
     );
 
     CORE__WB core__wb(
@@ -168,15 +177,69 @@ module CORE__ID (
     input   wire[31:0]  i_regs_1_data,
     input   wire[31:0]  i_regs_2_data,
 
-    output  wire[31:0]  o_reg_A_data,
-    output  wire[31:0]  o_reg_B_data,
-    output  wire[31:0]  o_imm,
+    input   wire[37:0]  i_ex_bypass,
+    input   wire[36:0]  i_mem_bypass,
 
-    output  wire[`UI_EX_LEN-1:0]    o_ui_ex,
-    output  wire[`UI_MEM_LEN-1:0]   o_ui_mem,
-    output  wire[`UI_WB_LEN-1:0]    o_ui_wb,
-    output  wire[`UI_PC_LEN-1:0]    o_ui_pc
+    output  reg [31:0]  o_reg_A_data,
+    output  reg [31:0]  o_reg_B_data,
+    output  reg [31:0]  o_imm,
+
+    output  reg [`UI_EX_LEN-1:0]    o_ui_ex,
+    output  reg [`UI_MEM_LEN-1:0]   o_ui_mem,
+    output  reg [`UI_WB_LEN-1:0]    o_ui_wb,
+    output  reg [`UI_PC_LEN-1:0]    o_ui_pc,
+
+    output  wire        o_pause
 );
+
+    wire[`UI_EX_LEN-1:0]    ui_ex;
+    wire[`UI_MEM_LEN-1:0]   ui_mem;
+    wire[`UI_WB_LEN-1:0]    ui_wb;
+    wire[`UI_PC_LEN-1:0]    ui_pc;
+    wire[31:0]              imm;
+        
+    DEC dec(
+        .i_inst(i_inst),
+        .o_ui_ex(ui_ex),
+        .o_ui_mem(ui_mem),
+        .o_ui_wb(ui_wb),
+        .o_ui_pc(ui_pc),
+        .o_imm(imm),
+        .o_regs_1_sel(o_regs_1_sel),
+        .o_regs_2_sel(o_regs_2_sel)
+    );
+    wire[31:0]  reg_A_data, reg_B_data;
+    BYPASS bypass(
+        .i_regs_1_sel(o_regs_1_sel),
+        .i_regs_2_sel(o_regs_2_sel),
+        .i_regs_1_data(i_regs_1_data),
+        .i_regs_2_data(i_regs_2_data),
+        .i_ex_bypass(i_ex_bypass),
+        .i_mem_bypass(i_mem_bypass),
+        .o_reg_A_data(reg_A_data),
+        .o_reg_B_data(reg_B_data),
+        .o_pause(o_pause)
+    );
+    always @(negedge i_CLK) begin
+        if (i_EN) begin
+            o_ui_ex     <= ui_ex;
+            o_ui_mem    <= ui_mem;
+            o_ui_wb     <= ui_wb;
+            o_ui_pc     <= ui_pc;
+            o_imm       <= imm;
+            o_reg_A_data<= reg_A_data;
+            o_reg_B_data<= reg_B_data;
+        end
+        if (i_RST) begin
+            o_ui_ex     <= {`UI_EX_LEN{1'b0}};
+            o_ui_mem    <= {`UI_MEM_LEN{1'b0}};
+            o_ui_wb     <= {`UI_WB_LEN{1'b0}};
+            o_ui_pc     <= {`UI_PC_LEN{1'b0}};
+            o_imm       <= 32'b0;
+            o_reg_A_data<= 32'd0;
+            o_reg_B_data<= 32'd0;
+        end
+    end
     
 endmodule
 
@@ -202,7 +265,8 @@ module CORE__EX (
     output  reg [`UI_WB_LEN-1:0]    o_ui_wb,
 
     output  reg [31:0]              o_RAM_addr,
-    output  reg [31:0]              o_ex_data
+    output  reg [31:0]              o_ex_data,
+    output  wire[37:0]              o_ex_bypass
 
 );
     wire[3:0]   ALU_mode      = i_ui_ex[3:0];
@@ -250,9 +314,9 @@ module CORE__EX (
         end
     end
 
-    wire    pc_set = (pc_jmp) | (pc_b_en & (pc_b_neg ^ ALU_result[0]));
+    assign  o_pc_set = (pc_jmp) | (pc_b_en & (pc_b_neg ^ (|ALU_result)));
     assign  o_pc   = pc_jalr ? ALU_result : pc_add_imm;
-    
+    assign  o_ex_bypass = {i_ui_mem[4], i_ui_wb, final_out};
 endmodule
 
 module CORE__MEM (
@@ -268,31 +332,36 @@ module CORE__MEM (
 
     input   wire[`UI_MEM_LEN-1:0]   i_ui_mem,
     output  wire                    o_RAM_w_en,
+    output  wire                    o_RAM_unsign,
     output  wire[1:0]               o_RAM_mode,
 
     input   wire[`UI_WB_LEN-1:0]    i_ui_wb,
     output  reg [`UI_WB_LEN-1:0]    o_ui_wb,
 
-    output  reg [31:0]              o_mem_data
+    output  reg [31:0]              o_mem_data,
+    output  wire[36:0]              o_mem_bypass
 );
-    assign      o_RAM_addr = i_RAM_addr;
-    assign      o_RAM_data = i_ex_data;
-    assign      o_RAM_mode = i_ui_mem[1:0];
-    assign      o_RAM_w_en = i_ui_mem[2];
-    wire        load_inst  = i_ui_mem[3];
+    assign      o_RAM_addr      = i_RAM_addr;
+    assign      o_RAM_data      = i_ex_data;
+    assign      o_RAM_mode      = i_ui_mem[1:0];
+    assign      o_RAM_unsign    = i_ui_mem[2];
+    assign      o_RAM_w_en      = i_ui_mem[3];
+    wire        load_inst       = i_ui_mem[4];
     
     wire[31:0]  selected_data = load_inst ? i_RAM_data : i_ex_data;
-
+    
     always @(negedge i_CLK) begin
         if (i_EN) begin
             o_mem_data  <= selected_data;
             o_ui_wb     <= i_ui_wb;
         end
         if (i_RST) begin
-            o_mem_data  <= selected_data;
+            o_mem_data  <= 32'd0;
             o_ui_wb     <= {`UI_WB_LEN{1'd0}};
         end
     end
+
+    assign  o_mem_bypass = {i_ui_wb, selected_data};
     
 endmodule
 
